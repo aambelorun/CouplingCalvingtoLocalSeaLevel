@@ -1,0 +1,138 @@
+%required Data
+accpath   = '/Users/aambelorun3/ISSM/examples/filesfromthayerhpc/ModelData/RACMO2Antarctica/basin_Antarctica_1km_RACMO2.mat';
+%accpath   = ['/proj/ecco/ModelData/RACMO2Antarctica/annprecip33.mat'];
+
+disp('   Interpolating mask');
+mask = interpBedmachineAntarctica(md.mesh.x,md.mesh.y,'mask');
+md.mask.ice_levelset=mask;
+pos=find(md.mask.ice_levelset>0.1);
+pos2=find(md.mask.ice_levelset<=0.1);
+md.mask.ice_levelset(pos)=-1;
+md.mask.ice_levelset(pos2)=1;
+md.mask.ocean_levelset = +1*ones(md.mesh.numberofvertices,1);
+pos = find(mask==0 | mask==3);
+md.mask.ocean_levelset(pos)=-1;
+
+disp('   Setting up geometry');
+%bed
+%md.geometry.bed				 = interpBedmap2(md.mesh.x,md.mesh.y,'bed');
+md.geometry.bed				 = interpBedmachineAntarctica(md.mesh.x,md.mesh.y,'bed');
+flag								 = find(isnan(md.geometry.bed));
+pos1								 = find(flag);
+pos2								 = find(~flag);
+md.geometry.bed(pos1)		 = griddata(md.mesh.x(pos2),md.mesh.y(pos2),md.geometry.bed(pos2),md.mesh.x(pos1),md.mesh.y(pos1),'nearest');
+%surface
+%md.geometry.surface		    = interpBedmap2(md.mesh.x,md.mesh.y,'surface');
+md.geometry.surface		    = interpBedmachineAntarctica(md.mesh.x,md.mesh.y,'surface');
+%thickness
+%md.geometry.thickness		 = interpBedmap2(md.mesh.x,md.mesh.y,'thickness');
+md.geometry.thickness		 = interpBedmachineAntarctica(md.mesh.x,md.mesh.y,'thickness');
+%base
+md.geometry.base				 = md.geometry.surface - md.geometry.thickness;
+
+disp('      -- correct surface with firn correction ');
+firn=interpSeaRISE(md.mesh.x,md.mesh.y,'firn',-1);
+md.geometry.surface=max(md.geometry.surface,md.geometry.bed+10);
+md.geometry.surface=max(md.geometry.surface,10);
+md.geometry.base=md.geometry.bed;
+rho_water=1028.9;
+di=md.materials.rho_ice/rho_water;
+pos=find(-di/(1-di)*md.geometry.surface > md.geometry.bed);
+md.geometry.base(pos)=di/(di-1)*md.geometry.surface(pos);
+md.geometry.thickness=md.geometry.surface-md.geometry.base;
+md.mask.ocean_levelset=md.geometry.thickness+md.geometry.bed/di;
+
+disp('   Reading velocities ');
+[md.inversion.vx_obs md.inversion.vy_obs]=interpMouginotAnt2017(md.mesh.x,md.mesh.y);
+pos=find(isnan(md.inversion.vx_obs) | isnan(md.inversion.vy_obs));
+md.inversion.vx_obs(pos)=0;
+md.inversion.vy_obs(pos)=0;
+md.inversion.vel_obs  = sqrt(md.inversion.vx_obs.^2+md.inversion.vy_obs.^2);
+md.initialization.vx  = md.inversion.vx_obs;
+md.initialization.vy  = md.inversion.vy_obs;
+md.initialization.vz  = zeros(md.mesh.numberofvertices,1);
+md.initialization.vel = md.inversion.vel_obs;
+
+%Basal friction
+disp('   Initialize basal friction using driving stress');
+disp('      -- Compute surface slopes and use 10 L2 projections');
+[sx,sy,s]=slope(md); sslope=averaging(md,s,10);
+disp('      -- Process surface velocity data');
+vel = md.inversion.vel_obs;
+flags=(vel==0); pos1=find(flags); pos2=find(~flags);
+vel(pos1) = griddata(md.mesh.x(pos2),md.mesh.y(pos2),vel(pos2),md.mesh.x(pos1),md.mesh.y(pos1));
+vel=max(vel,0.1);
+disp('      -- Calculate effective pressure');
+Neff = (md.materials.rho_ice*md.geometry.thickness+md.materials.rho_water*md.geometry.base).*md.constants.g;
+Neff(find(Neff<=0))=1;
+disp('      -- Deduce friction coefficient');
+md.friction.coefficient=sqrt(md.materials.rho_ice*md.geometry.thickness.*(sslope)./(Neff.*vel/md.constants.yts)); %Budd
+md.friction.coefficient=min(md.friction.coefficient,1000);
+md.friction.q = ones(md.mesh.numberofelements,1);
+md.friction.p = ones(md.mesh.numberofelements,1);
+disp('      -- Extrapolate on not grounded regions');
+flags=(md.mask.ocean_levelset<0); pos1=find(flags); pos2=find(~flags);
+%md.friction.coefficient(pos1) = griddata(md.mesh.x(pos2),md.mesh.y(pos2),md.friction.coefficient(pos2),md.mesh.x(pos1),md.mesh.y(pos1));
+md.friction.coefficient(pos1) = 10;
+pos=find(isnan(md.friction.coefficient));
+md.friction.coefficient(pos)  = 1;
+
+
+%flow law
+disp('   Creating flow law parameters (assume ice is at -10°C for now)');
+md.materials.rheology_n = 3*ones(md.mesh.numberofelements,1);
+md.materials.rheology_B = cuffey(273.15 - 15)*ones(md.mesh.numberofvertices,1);
+md.materials.rheology_law = 'Cuffey';
+
+disp('   Loading accumulation rates from RACMO ');
+load(accpath);
+if 1,
+	md.smb.mass_balance = InterpFromGridToMesh(x_m,y_m,accumulation,md.mesh.x,md.mesh.y,-99999);
+	clear x_m y_m accumulation
+else
+	index=delaunay(x1,y1);
+	md.smb.mass_balance = InterpFromMeshToMesh2d(index,x1(:),y1(:),annprecip33(:),md.mesh.x,md.mesh.y,'default',NaN);
+	clear x1 y1 index
+end
+md.basalforcings.groundedice_melting_rate = zeros(md.mesh.numberofvertices,1);
+md.basalforcings.floatingice_melting_rate= zeros(md.mesh.numberofvertices,1);
+disp('   Loading melting rates from remote sensing observations:');
+%pos=find(md.mask.ocean_levelset<0);
+md.basalforcings.floatingice_melting_rate = interpRignotIceShelfMelt(md.mesh.x,md.mesh.y,'melt_actual');
+%pos=find(md.mask.ocean_levelset>0);
+%pos2=find(md.mask.ocean_levelset<0);
+%md.basalforcings.floatingice_melting_rate(pos) = griddata(md.mesh.x(pos2),md.mesh.y(pos2),md.basalforcings.floatingice_melting_rate(pos2),md.mesh.x(pos),md.mesh.y(pos),'nearest');
+%md.basalforcings.floatingice_melting_rate(find(md.mask.ocean_levelset>0))=0;
+%load 'Par/AseMelt.mat';
+%md.basalforcings.floatingice_melting_rate = AseMelt;
+
+
+disp('   Geothermal heat flux from Stal et al. 2020 data:');
+md.basalforcings.geothermalflux = interpStal2020(md.mesh.x,md.mesh.y);
+
+disp('   Setting up thermal model');
+md.initialization.temperature=min(0,interpSeaRISE(md.mesh.x,md.mesh.y,'temp',-1))+273.15;
+md.initialization.waterfraction=zeros(md.mesh.numberofvertices,1);
+md.initialization.watercolumn=zeros(md.mesh.numberofvertices,1);
+md.thermal.spctemperature=md.initialization.temperature;
+md.thermal.isenthalpy=1;
+md.thermal.isdynamicbasalspc=1;
+md.materials.rheology_B=cuffey(md.initialization.temperature);
+
+%Deal with boundary conditions:
+disp('   Set Boundary conditions');
+md.stressbalance.spcvx=NaN*ones(md.mesh.numberofvertices,1);
+md.stressbalance.spcvy=NaN*ones(md.mesh.numberofvertices,1);
+md.stressbalance.spcvz=NaN*ones(md.mesh.numberofvertices,1);
+md.stressbalance.referential=NaN*ones(md.mesh.numberofvertices,6);
+md.stressbalance.loadingforce=0*ones(md.mesh.numberofvertices,3);
+
+%Add spc everywhere first where ice
+pos=find(md.mesh.vertexonboundary & md.mask.ice_levelset<0);
+md.stressbalance.spcvx(pos)=md.inversion.vx_obs(pos);
+md.stressbalance.spcvy(pos)=md.inversion.vy_obs(pos);
+md.stressbalance.spcvz(pos)=md.initialization.vz(pos);
+
+in=ContourToMesh(md.mesh.elements,md.mesh.x,md.mesh.y,'./Exp/IceFront.exp','node',1);
+md.mask.ice_levelset(find(in & md.mesh.vertexonboundary==1))=1;
+
